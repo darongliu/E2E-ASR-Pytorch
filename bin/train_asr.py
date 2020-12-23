@@ -9,6 +9,7 @@ from src.optim import Optimizer
 from src.data import load_dataset
 from src.util import human_format, cal_er, feat_to_fig, LabelSmoothingLoss
 from src.audio import Delta, Postprocess, Augment
+from src.augmentation import Augmentation
 
 EMPTY_CACHE_STEP = 100
 
@@ -65,6 +66,7 @@ class Solver(BaseSolver):
         #print(self.feat_dim) #160
         batch_size = self.config['data']['corpus']['batch_size']//2
         self.model = ASR(self.feat_dim, self.vocab_size, batch_size, **self.config['model']).to(self.device)
+        self.aug   =  Augmentation(**self.config['augmentation']).to(self.device)
 
 
 
@@ -94,6 +96,7 @@ class Solver(BaseSolver):
             self.verbose(self.emb_decoder.create_msg())
 
         # Optimizer
+        # TODO init aug optimizer
         self.optimizer = Optimizer(model_paras, **self.config['hparas'])
         self.lr_scheduler = self.optimizer.lr_scheduler
         self.verbose(self.optimizer.create_msg())
@@ -110,6 +113,10 @@ class Solver(BaseSolver):
         
         # Automatically load pre-trained model if self.paras.load is given
         self.load_ckpt()
+
+    def train_augmentation(self):
+        # TODO
+        pass
 
     def exec(self):
         ''' Training End-to-end ASR system '''

@@ -19,7 +19,6 @@ data:
     ref_level_db: 20
     min_level_db: -100
     preemphasis_coeff: 0.97
-    augment: True
     time_aug: False
   text:
     mode: 'character'                     # 'character'/'word == phone'/'subword'
@@ -67,4 +66,8 @@ model:                                    # Model architecture
     dim: 1024
     layer: 2
     dropout: 0
+  augmentation:
+    trainable: True                       # True: trainable aug, False: normal specaug
+    augment: True
+  
 

@@ -460,8 +460,6 @@ def create_transform(audio_config, post_process=True, mode='train'):
     feat_type = audio_config.pop("feat_type")
     
     feat_dim = audio_config.pop("feat_dim")
-    '''specaug'''
-    augment = audio_config.pop("augment")
     '''time domain augment'''
     time_aug = audio_config.pop("time_aug")
 
@@ -478,8 +476,6 @@ def create_transform(audio_config, post_process=True, mode='train'):
     
     if post_process:
         transforms.append(Postprocess())
-    if augment and mode=='train':
-        transforms.append(Augment())
         
 
     return nn.Sequential(*transforms), feat_dim * (delta_order + 1) # 80 *2 feature D
