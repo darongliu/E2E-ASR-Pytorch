@@ -56,3 +56,23 @@ class Optimizer():
     def create_msg(self):
         return ['Optim.spec.| Algo. = {}\t| Lr = {}\t (schedule = {})| Scheduled sampling = {}'\
                    .format(self.opt_type, self.init_lr, self.sch_type, self.tf_type)]
+
+class AugOptimizer():
+    def __init__(self, parameters, lr, weight_decay):
+        self.lr = lr
+        self.opt = torch.optim.Adam(parameters, lr=lr, betas=(0.5, 0.999), weight_decay=weight_decay)
+
+    def get_opt_state_dict(self):
+        return self.opt.state_dict()
+
+    def load_opt_state_dict(self,state_dict):
+        self.opt.load_state_dict(state_dict)
+    
+    def get_lr(self, step):
+        return self.lr
+
+    def step(self):
+        self.opt.step()
+
+    def create_msg(self):
+        return ['Optim.spec.| Algo. = {}\t| Lr = {}\t '.format('adam', self.lr)]

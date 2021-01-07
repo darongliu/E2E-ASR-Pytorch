@@ -66,8 +66,23 @@ model:                                    # Model architecture
     dim: 1024
     layer: 2
     dropout: 0
-  augmentation:
-    trainable: True                       # True: trainable aug, False: normal specaug
-    augment: True
+
+augmentation:
+  type: 'trainaug' # specaug, use_pretrain_aug, train_aug
+  specaug: 
+  trainable_aug:
+    model:
+      T_num_masks: 3
+      F_num_masks: 3 
+      noise_dim: 10
+      dim: [10, 10, 10]
+      norm: [True, True, True]
+      load_path: ''
+    optimizer:
+      lr: 1.0
+      weight_decay: 1e-3
+
+
+
   
 

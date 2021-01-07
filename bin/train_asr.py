@@ -5,11 +5,11 @@ import yaml
 from src.solver import BaseSolver
 
 from src.asr import ASR
-from src.optim import Optimizer
+from src.optim import Optimizer, AugOptimizer
 from src.data import load_dataset
 from src.util import human_format, cal_er, feat_to_fig, LabelSmoothingLoss
 from src.audio import Delta, Postprocess, Augment
-from src.augmentation import Augmentation
+from src.augmentation import DifferentiableAugmentation, SpecAugment
 
 EMPTY_CACHE_STEP = 100
 
@@ -66,10 +66,13 @@ class Solver(BaseSolver):
         #print(self.feat_dim) #160
         batch_size = self.config['data']['corpus']['batch_size']//2
         self.model = ASR(self.feat_dim, self.vocab_size, batch_size, **self.config['model']).to(self.device)
-        self.aug   =  Augmentation(**self.config['augmentation']).to(self.device)
-
-
-
+        if self.config['augmentation']['type'] == 'specaug':
+            self.aug = SpecAugment(**self.config['augmentation']['specaug'])
+        elif self.config['augmentation']['type'] == 'use_pretrain_aug':
+            self.aug   =  DifferentiableAugmentation(**self.config['augmentation']['trainable_aug']['model']).to(self.device)
+        elif self.config['augmentation']['type'] == 'train_aug':
+            self.config['augmentation']['trainable_aug']['model']['load_path'] = ''
+            self.aug   =  DifferentiableAugmentation(**self.config['augmentation']['trainable_aug']['model']).to(self.device)
         self.verbose(self.model.create_msg())
         model_paras = [{'params':self.model.parameters()}]
 
@@ -83,23 +86,14 @@ class Solver(BaseSolver):
             self.seq_loss = torch.nn.CrossEntropyLoss(ignore_index=0)
         self.ctc_loss = torch.nn.CTCLoss(blank=0, zero_infinity=False) # Note: zero_infinity=False is unstable?
 
-        # Plug-ins
-        self.emb_fuse = False
-        self.emb_reg = ('emb' in self.config) and (self.config['emb']['enable'])
-        if self.emb_reg:
-            from src.plugin import EmbeddingRegularizer
-            self.emb_decoder = EmbeddingRegularizer(self.tokenizer, self.model.dec_dim, **self.config['emb']).to(self.device)
-            model_paras.append({'params':self.emb_decoder.parameters()})
-            self.emb_fuse = self.emb_decoder.apply_fuse
-            if self.emb_fuse:
-                self.seq_loss = torch.nn.NLLLoss(ignore_index=0)
-            self.verbose(self.emb_decoder.create_msg())
-
         # Optimizer
-        # TODO init aug optimizer
         self.optimizer = Optimizer(model_paras, **self.config['hparas'])
         self.lr_scheduler = self.optimizer.lr_scheduler
         self.verbose(self.optimizer.create_msg())
+
+        # aug optimizer
+        if self.config['augmentation']['type'] == 'train_aug':
+            self.aug_optimizer = AugOptimizer(**sself.config['augmentation']['trainable_aug']['optimizer'])
 
         # Enable AMP if needed
         self.enable_apex()
@@ -114,9 +108,138 @@ class Solver(BaseSolver):
         # Automatically load pre-trained model if self.paras.load is given
         self.load_ckpt()
 
-    def train_augmentation(self):
-        # TODO
-        pass
+    def train_augmentation(self, tr_data, dv_data, eta):
+        # TODO only assume SGD as model optimizer, try to design the loss from model optimizer 
+        # eta: learning rate of the one step SGD
+        self.aug_optimizer.zero_grad()
+
+        # move from _backward_step_unrolled
+        unrolled_model = self._compute_unrolled_model(input_train, target_train, eta, network_optimizer)
+        # forward dev data on new model
+        feat, feat_len, txt, txt_len = self.fetch_data(dv_data, train=True)
+        ctc_output, encode_len, att_output, att_align, dec_state = \
+            self.model( feat, feat_len, max(txt_len), tf_rate=tf_rate,
+                            teacher=txt, get_dec_state=False)
+        # Clear not used objects
+        del att_align
+        del dec_state
+        unrolled_loss = self.calc_asr_loss(stop_step, txt, txt_len, encode_len, att_output)
+        unrolled_loss.backward()
+
+        vector = [v.grad.data for v in unrolled_model.parameters()] # right term of equation 18 in dada
+        implicit_grads = self._hessian_vector_product(vector, tr_data)
+
+        for v, ig in zip(self.aug.parameters(), implicit_grads):
+            v.grad.sub_(eta, ig.data)
+
+        for v, g in zip(self.aug.parameters(), implicit_grads):
+            x = -eta*g
+            if v.grad is None:
+                v.grad = Variable(x)
+            else:
+                v.grad.data.copy_(x)
+        self.aug_optimizer.step()
+
+    def _compute_unrolled_model(self, tr_data, eta):
+        # generate new ASR model with model parameters with one step SGD
+        # curently only use SGD optimizer for origin model
+        feat, feat_len, txt, txt_len = self.fetch_data(tr_data, train=True)
+        feat = self.aug(feat)
+        ctc_output, encode_len, att_output, att_align, dec_state = \
+            self.model( feat, feat_len, max(txt_len), tf_rate=tf_rate,
+                            teacher=txt, get_dec_state=False)
+        # Clear not used objects
+        del att_align
+        del dec_state
+        loss = self.calc_asr_loss(stop_step, txt, txt_len, encode_len, att_output)
+
+        theta = _concat(self.model.parameters()).data # theta: model parameters
+        moment = torch.zeros_like(theta) # TODO, try other optimization method
+        dtheta = _concat(torch.autograd.grad(loss, self.model.parameters())).data
+        try:
+            network_weight_decay = self.config['hparas']['weight_decay']
+            dtheta += network_weight_decay*theta
+
+        unrolled_model = self._construct_model_from_theta(theta.sub(eta, moment+dtheta))
+        return unrolled_model
+
+    def _construct_model_from_theta(self, theta):
+        # called by _compute_unrolled_model
+        # generate a new model with given theta(model parameters)
+        model_new = self.model.new()
+        model_dict = self.model.state_dict()
+
+        params, offset = {}, 0
+        for k, v in self.model.named_parameters():
+        v_length = np.prod(v.size())
+        params[k] = theta[offset: offset+v_length].view(v.size())
+        offset += v_length
+
+        assert offset == len(theta)
+        model_dict.update(params)
+        model_new.load_state_dict(model_dict)
+        return model_new.to(self.device)
+
+    def _hessian_vector_product(self, vector, tr_data, r=1e-2):
+        R = r / _concat(vector).norm()
+        for p, v in zip(self.model.parameters(), vector):
+            p.data.add_(R, v)
+        feat, feat_len, txt, txt_len = self.fetch_data(tr_data, train=True)
+        feat = self.aug(feat)
+        ctc_output, encode_len, att_output, att_align, dec_state = \
+            self.model( feat, feat_len, max(txt_len), tf_rate=tf_rate,
+                            teacher=txt, get_dec_state=False)
+        # Clear not used objects
+        del att_align
+        del dec_state
+        loss = self.calc_asr_loss(stop_step, txt, txt_len, encode_len, att_output)
+        grads_p = torch.autograd.grad(loss, self.aug.parameters())
+
+        for p, v in zip(self.model.parameters(), vector):
+            p.data.sub_(2*R, v)
+        ctc_output, encode_len, att_output, att_align, dec_state = \
+            self.model( feat, feat_len, max(txt_len), tf_rate=tf_rate,
+                            teacher=txt, get_dec_state=False)
+        # Clear not used objects
+        del att_align
+        del dec_state
+        loss = self.calc_asr_loss(stop_step, txt, txt_len, encode_len, att_output)
+        grads_n = torch.autograd.grad(loss, self.aug.parameters())
+
+        for p, v in zip(self.model.parameters(), vector):
+            p.data.add_(R, v)
+
+        return [(x-y).div_(2*R) for x, y in zip(grads_p, grads_n)]
+
+    def calc_asr_loss(self, stop_step, txt, txt_len, encode_len, att_output):
+        total_loss = 0
+        ''' early stopping ctc'''
+        if self.early_stoping:
+            if self.step > stop_step:
+                ctc_output = None
+                self.model.ctc_weight = 0
+        #print(ctc_output.shape)
+        # Compute all objectives
+        if ctc_output is not None:
+            if self.paras.cudnn_ctc:
+                ctc_loss = self.ctc_loss(ctc_output.transpose(0,1), 
+                                            txt.to_sparse().values().to(device='cpu',dtype=torch.int32),
+                                            [ctc_output.shape[1]]*len(ctc_output),
+                                            #[int(encode_len.max()) for _ in encode_len],
+                                            txt_len.cpu().tolist())
+            else:
+                ctc_loss = self.ctc_loss(ctc_output.transpose(0,1), txt, encode_len, txt_len)
+            total_loss += ctc_loss*self.model.ctc_weight
+            del encode_len
+
+        if att_output is not None:
+            #print(att_output.shape)
+            b,t,_ = att_output.shape
+            att_loss = self.seq_loss(att_output.view(b*t,-1),txt.view(-1))
+            # Sum each uttr and devide by length then mean over batch
+            # att_loss = torch.mean(torch.sum(att_loss.view(b,t),dim=-1)/torch.sum(txt!=0,dim=-1).float())
+            total_loss += att_loss*(1-self.model.ctc_weight)
+        return total_loss
 
     def exec(self):
         ''' Training End-to-end ASR system '''
@@ -149,64 +272,36 @@ class Solver(BaseSolver):
                                       False, **self.config['data'])
             
             
-            for data in self.tr_set:
+            for tr_data in self.tr_set:
                 # Pre-step : update tf_rate/lr_rate and do zero_grad
                 tf_rate = self.optimizer.pre_step(self.step)
-                total_loss = 0
                 
                 # Fetch data
-                feat, feat_len, txt, txt_len = self.fetch_data(data, train=True)
+                feat, feat_len, txt, txt_len = self.fetch_data(tr_data, train=True)
+                feat = self.aug(feat)
             
                 self.timer.cnt('rd')
                 # Forward model
                 # Note: txt should NOT start w/ <sos>
                 ctc_output, encode_len, att_output, att_align, dec_state = \
                     self.model( feat, feat_len, max(txt_len), tf_rate=tf_rate,
-                                    teacher=txt, get_dec_state=self.emb_reg)
+                                    teacher=txt, get_dec_state=False)
                 # Clear not used objects
                 del att_align
+                del dec_state
 
-                # Plugins
-                if self.emb_reg:
-                    emb_loss, fuse_output = self.emb_decoder( dec_state, att_output, label=txt) 
-                    total_loss += self.emb_decoder.weight*emb_loss
-                else:
-                    del dec_state
-
-                ''' early stopping ctc'''
-                if self.early_stoping:
-                    if self.step > stop_step:
-                        ctc_output = None
-                        self.model.ctc_weight = 0
-                #print(ctc_output.shape)
-                # Compute all objectives
-                if ctc_output is not None:
-                    if self.paras.cudnn_ctc:
-                        ctc_loss = self.ctc_loss(ctc_output.transpose(0,1), 
-                                                 txt.to_sparse().values().to(device='cpu',dtype=torch.int32),
-                                                 [ctc_output.shape[1]]*len(ctc_output),
-                                                 #[int(encode_len.max()) for _ in encode_len],
-                                                 txt_len.cpu().tolist())
-                    else:
-                        ctc_loss = self.ctc_loss(ctc_output.transpose(0,1), txt, encode_len, txt_len)
-                    total_loss += ctc_loss*self.model.ctc_weight
-                    del encode_len
-
-                if att_output is not None:
-                    #print(att_output.shape)
-                    b,t,_ = att_output.shape
-                    att_output = fuse_output if self.emb_fuse else att_output
-                    att_loss = self.seq_loss(att_output.view(b*t,-1),txt.view(-1))
-                    # Sum each uttr and devide by length then mean over batch
-                    # att_loss = torch.mean(torch.sum(att_loss.view(b,t),dim=-1)/torch.sum(txt!=0,dim=-1).float())
-                    total_loss += att_loss*(1-self.model.ctc_weight)
+                total_loss = self.calc_asr_loss(stop_step, txt, txt_len, encode_len, att_output)
 
                 self.timer.cnt('fw')
 
                 # Backprop
-                grad_norm = self.backward(total_loss)             
+                grad_norm = self.backward(total_loss) # include optimizer step inside BaseSolver
 
                 self.step+=1
+
+                # train aug
+                dv_data = next(iter(self.dv_set))
+                self.train_augmentation(tr_data, dv_data, self.optimizer.opt.param_groups[0]['lr'])
                 
                 # Logger
                 if (self.step==1) or (self.step%self.PROGRESS_STEP==0):
@@ -227,10 +322,6 @@ class Solver(BaseSolver):
                     #     self.write_log('spec_train',feat_to_fig(feat[0].transpose(0,1).cpu().detach(), spec=True))
                     #del total_loss
                     
-                    if self.emb_fuse: 
-                        if self.emb_decoder.fuse_learnable:
-                            self.write_log('fuse_lambda',{'emb':self.emb_decoder.get_weight()})
-                        self.write_log('fuse_temp',{'temp':self.emb_decoder.get_temp()})
 
                 # Validation
                 if (self.step==1) or (self.step%self.valid_step == 0):
